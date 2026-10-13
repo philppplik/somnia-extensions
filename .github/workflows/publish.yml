@@ -1,0 +1,47 @@
+name: publish-signed-index
+# Signs and publishes the catalog. Manual, main only, behind the `catalog-signing` environment
+# (required reviewer: philppplik). The private key exists only as that environment's secret SOMNIA_CATALOG_KEY.
+# Never triggered by pull_request or fork events.
+on:
+  workflow_dispatch:
+concurrency: publish-signed-index
+permissions:
+  contents: write
+jobs:
+  publish:
+    if: github.ref == 'refs/heads/main' && github.repository == 'philppplik/somnia-extensions'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: catalog-signing
+    steps:
+      - uses: actions/checkout@v4
+        with: {ref: main, fetch-depth: 0}
+      - uses: actions/setup-node@v4
+        with: {node-version: 22}
+      - name: Checks before signing
+        run: |
+          node tools/lint-entries.mjs
+          node --test test/tools.test.mjs
+      - name: Previous published index (rollback floor)
+        run: git show origin/published:catalog/index.json > /tmp/prev-index.json 2>/dev/null || rm -f /tmp/prev-index.json
+      - name: Build and sign
+        run: |
+          KEY_ID=$(node -e "console.log(JSON.parse(require('fs').readFileSync('keys/public-keys.json','utf8')).keys[0].keyId)")
+          node tools/build-index.mjs --key-id "$KEY_ID" --prev /tmp/prev-index.json
+          node tools/sign.mjs
+        env:
+          SOMNIA_CATALOG_KEY: ${{ secrets.SOMNIA_CATALOG_KEY }}
+      - name: Verify what was just signed (public keys only)
+        run: |
+          PREV=$(node -e "try{console.log(JSON.parse(require('fs').readFileSync('/tmp/prev-index.json','utf8')).serial)}catch{console.log('')}")
+          node tools/verify.mjs ${PREV:+--prev-serial $PREV}
+      - name: Publish to the published branch
+        run: |
+          SERIAL=$(node -e "console.log(JSON.parse(require('fs').readFileSync('catalog/index.json','utf8')).serial)")
+          D=$(mktemp -d); cp catalog/index.json catalog/index.json.sig "$D"/
+          git config user.name "somnia-extensions[bot]"; git config user.email "noreply@github.com"
+          git checkout --orphan published-new; git rm -rf -q . ; mkdir -p catalog; cp "$D"/index.json "$D"/index.json.sig catalog/
+          git add catalog; git commit -q -m "index serial $SERIAL"
+          git tag "index-$SERIAL"
+          git push --force origin published-new:published
+          git push origin "index-$SERIAL"
